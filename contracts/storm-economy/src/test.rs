@@ -5,11 +5,15 @@ use soroban_sdk::testutils::Address as _;
 use soroban_sdk::Env;
 
 fn setup(env: &Env) -> (StormEconomyClient<'_>, Address) {
+    setup_with_persona(env, Persona::Classic)
+}
+
+fn setup_with_persona(env: &Env, persona: Persona) -> (StormEconomyClient<'_>, Address) {
     env.mock_all_auths();
     let contract_id = env.register(StormEconomy, ());
     let client = StormEconomyClient::new(env, &contract_id);
     let player = Address::generate(env);
-    client.join(&player);
+    client.join(&player, &persona);
     (client, player)
 }
 
@@ -29,7 +33,7 @@ fn join_sets_starting_state() {
 fn double_join_fails() {
     let env = Env::default();
     let (client, player) = setup(&env);
-    let err = client.try_join(&player);
+    let err = client.try_join(&player, &Persona::Classic);
     assert_eq!(err, Err(Ok(Error::AlreadyJoined)));
 }
 
@@ -134,6 +138,77 @@ fn loan_then_repay_round_trips_cash_and_loan_count() {
     let after_repay = client.get_state(&player);
     assert_eq!(after_repay.loans, 0);
     assert_eq!(after_repay.cash, after_loan.cash - LOAN_REPAY_COST);
+}
+
+#[test]
+fn hustler_side_hustle_pays_five_not_three() {
+    let env = Env::default();
+    let (client, player) = setup_with_persona(&env, Persona::Hustler);
+    client.roll_and_pay(&player);
+    let before = client.get_state(&player);
+    client.take_action(&player, &Action::SideHustle);
+    let after = client.get_state(&player);
+    assert_eq!(after.cash - before.cash, HUSTLER_SIDE_HUSTLE_GAIN);
+    assert_eq!(HUSTLER_SIDE_HUSTLE_GAIN, 5);
+}
+
+#[test]
+fn saver_pays_one_less_expense_per_round() {
+    let env = Env::default();
+    let (classic_client, classic_player) = setup_with_persona(&env, Persona::Classic);
+    let (saver_client, saver_player) = setup_with_persona(&env, Persona::Saver);
+
+    classic_client.roll_and_pay(&classic_player);
+    saver_client.roll_and_pay(&saver_player);
+
+    let classic_state = classic_client.get_state(&classic_player);
+    let saver_state = saver_client.get_state(&saver_player);
+    // Same starting cash, same roll odds per-env, different expense only;
+    // assert the raw expense gap rather than cash (cash also depends on
+    // the independent die roll each got), so this stays robust regardless
+    // of which event each env's prng produced this round.
+    assert_eq!(
+        classic_state.expenses(1) - saver_state.expenses(1),
+        SAVER_EXPENSE_DISCOUNT
+    );
+}
+
+#[test]
+fn builder_pays_less_for_stall_and_business() {
+    let env = Env::default();
+    let (client, player) = setup_with_persona(&env, Persona::Builder);
+    client.roll_and_pay(&player);
+    let before = client.get_state(&player);
+    client.take_action(&player, &Action::BuyStall);
+    let after_stall = client.get_state(&player);
+    assert_eq!(before.cash - after_stall.cash, STALL_COST - BUILDER_STALL_DISCOUNT);
+    assert_eq!(STALL_COST - BUILDER_STALL_DISCOUNT, 6);
+}
+
+#[test]
+fn gambler_side_hustle_is_zero_or_double_never_the_flat_rate() {
+    let env = Env::default();
+    let (client, player) = setup_with_persona(&env, Persona::Gambler);
+    client.roll_and_pay(&player);
+    let before = client.get_state(&player);
+    client.take_action(&player, &Action::SideHustle);
+    let after = client.get_state(&player);
+    let delta = after.cash - before.cash;
+    assert!(
+        delta == GAMBLER_SIDE_HUSTLE_LOSS || delta == GAMBLER_SIDE_HUSTLE_WIN,
+        "gambler side hustle gave {delta}, expected 0 or 6"
+    );
+}
+
+#[test]
+fn classic_persona_matches_original_flat_rates() {
+    let env = Env::default();
+    let (client, player) = setup_with_persona(&env, Persona::Classic);
+    client.roll_and_pay(&player);
+    let before = client.get_state(&player);
+    client.take_action(&player, &Action::SideHustle);
+    let after = client.get_state(&player);
+    assert_eq!(after.cash - before.cash, SIDE_HUSTLE_GAIN);
 }
 
 #[test]

@@ -11,7 +11,14 @@
 //! die is gameable because on-chain randomness without a commit-reveal
 //! scheme or VRF is predictable" is itself part of the lesson. Don't
 //! reuse this contract anywhere a predictable roll has real value on
-//! the line.
+//! the line. (`Persona::Gambler`'s Side Hustle coin flip uses the same
+//! predictable source -- same caveat applies to it.)
+//!
+//! Persona: chosen once at `join()`, fixed for the game. A real lever on
+//! this contract's own numbers (Side Hustle gain, expenses, stall/business
+//! cost) -- not client-side flavor. A player's chosen name/avatar has no
+//! gameplay effect and lives in the browser client instead, so it doesn't
+//! cost contract storage.
 #![no_std]
 
 use soroban_sdk::{contract, contracterror, contractevent, contractimpl, contracttype, Address, Env};
@@ -35,8 +42,29 @@ const STALL_PAY: i32 = 1;
 const BUSINESS_COST: i32 = 24;
 const BUSINESS_PAY: i32 = 4;
 
+// ---- Persona modifiers -----------------------------------------------
+// Chosen once at join() and fixed for the life of the game. Each persona
+// is a real lever on the contract's own numbers above -- not client-side
+// flavor -- so the choice has to be made before the first roll and can't
+// be changed mid-run (no "respec" call exists on purpose, same spirit as
+// the economy numbers themselves being fixed per game).
+const HUSTLER_SIDE_HUSTLE_GAIN: i32 = SIDE_HUSTLE_GAIN + 2; // 5
+const GAMBLER_SIDE_HUSTLE_LOSS: i32 = 0;
+const GAMBLER_SIDE_HUSTLE_WIN: i32 = SIDE_HUSTLE_GAIN * 2; // 6, same expectation as the flat 3
+const SAVER_EXPENSE_DISCOUNT: i32 = 1;
+const BUILDER_STALL_DISCOUNT: i32 = 2; // 8 -> 6
+const BUILDER_BUSINESS_DISCOUNT: i32 = 6; // 24 -> 18, same 25% as the stall discount
+
 fn base_expense(round: u32) -> i32 {
     BASE_EXPENSE + EXPENSE_STEP * ((round - 1) / EXPENSE_STEP_ROUNDS) as i32
+}
+
+fn stall_cost(persona: Persona) -> i32 {
+    if persona == Persona::Builder { STALL_COST - BUILDER_STALL_DISCOUNT } else { STALL_COST }
+}
+
+fn business_cost(persona: Persona) -> i32 {
+    if persona == Persona::Builder { BUSINESS_COST - BUILDER_BUSINESS_DISCOUNT } else { BUSINESS_COST }
 }
 
 #[contracttype]
@@ -46,6 +74,21 @@ pub enum EventRoll {
     Emergency,
     Calm,
     Storm,
+}
+
+/// Chosen once at join(), fixed for the life of the game. Each variant is
+/// a real on-chain economic lever (see the constants above), not cosmetic
+/// flavor -- the player's chosen name/avatar lives in the client instead,
+/// since that part has no gameplay effect and doesn't need to be paid for
+/// in contract storage.
+#[contracttype]
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Persona {
+    Classic,  // the original, unmodified economy -- no bonuses, no penalties
+    Hustler,  // Side Hustle pays more
+    Saver,    // expenses are lower every round
+    Builder,  // stalls and businesses cost less
+    Gambler,  // Side Hustle is high-variance: nothing, or double
 }
 
 fn roll_event(env: &Env) -> EventRoll {
@@ -73,6 +116,7 @@ pub struct Player {
     pub free_round: u32,     // 0 = hasn't hit the "Free" milestone yet
     pub final_score: i32,    // only meaningful once round > ROUNDS or bankrupt
     pub game_over: bool,
+    pub persona: Persona,
 }
 
 impl Player {
@@ -81,7 +125,8 @@ impl Player {
     }
 
     fn expenses(&self, round: u32) -> i32 {
-        base_expense(round) + self.loans as i32 * LOAN_EXPENSE + if self.insured { INSURANCE_EXPENSE } else { 0 }
+        let base = base_expense(round) + self.loans as i32 * LOAN_EXPENSE + if self.insured { INSURANCE_EXPENSE } else { 0 };
+        if self.persona == Persona::Saver { (base - SAVER_EXPENSE_DISCOUNT).max(0) } else { base }
     }
 }
 
@@ -152,9 +197,10 @@ pub struct StormEconomy;
 
 #[contractimpl]
 impl StormEconomy {
-    /// Register a fresh game for `player`. One contract instance can
-    /// hold many independent players, each keyed by their own address.
-    pub fn join(env: Env, player: Address) -> Result<(), Error> {
+    /// Register a fresh game for `player`, with a persona chosen once and
+    /// fixed for the life of the game. One contract instance can hold many
+    /// independent players, each keyed by their own address.
+    pub fn join(env: Env, player: Address, persona: Persona) -> Result<(), Error> {
         player.require_auth();
         let key = DataKey::Player(player.clone());
         if env.storage().persistent().has(&key) {
@@ -174,6 +220,7 @@ impl StormEconomy {
             free_round: 0,
             final_score: 0,
             game_over: false,
+            persona,
         };
         env.storage().persistent().set(&key, &state);
         extend_ttl(&env, &key);
@@ -278,21 +325,34 @@ impl StormEconomy {
 
         match action {
             Action::BuyStall => {
-                if p.cash < STALL_COST {
+                let cost = stall_cost(p.persona);
+                if p.cash < cost {
                     return Err(Error::CantAfford);
                 }
-                p.cash -= STALL_COST;
+                p.cash -= cost;
                 p.stalls += 1;
             }
             Action::BuyBusiness => {
-                if p.cash < BUSINESS_COST {
+                let cost = business_cost(p.persona);
+                if p.cash < cost {
                     return Err(Error::CantAfford);
                 }
-                p.cash -= BUSINESS_COST;
+                p.cash -= cost;
                 p.businesses += 1;
             }
             Action::SideHustle => {
-                p.cash += SIDE_HUSTLE_GAIN;
+                let gain = match p.persona {
+                    Persona::Hustler => HUSTLER_SIDE_HUSTLE_GAIN,
+                    Persona::Gambler => {
+                        if env.prng().gen_range::<u64>(0u64..=1u64) == 1u64 {
+                            GAMBLER_SIDE_HUSTLE_WIN
+                        } else {
+                            GAMBLER_SIDE_HUSTLE_LOSS
+                        }
+                    }
+                    _ => SIDE_HUSTLE_GAIN,
+                };
+                p.cash += gain;
             }
         }
         p.actions_left -= 1;

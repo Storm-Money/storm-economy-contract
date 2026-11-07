@@ -17,6 +17,13 @@
               "args": [
                 {
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
+                },
+                {
+                  "vec": [
+                    {
+                      "symbol": "Classic"
+                    }
+                  ]
                 }
               ]
             }
@@ -219,6 +226,18 @@
                     },
                     "val": {
                       "u32": 3
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "persona"
+                    },
+                    "val": {
+                      "vec": [
+                        {
+                          "symbol": "Classic"
+                        }
+                      ]
                     }
                   },
                   {

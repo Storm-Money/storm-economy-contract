@@ -19,9 +19,13 @@
 //! cost) -- not client-side flavor. A player's chosen name/avatar has no
 //! gameplay effect and lives in the browser client instead, so it doesn't
 //! cost contract storage.
+//!
+//! v3 adds `play_round`, which folds the roll and up to two actions into
+//! one transaction, plus the events and config view the indexer and web
+//! client had to work around. Every v2 entry point is unchanged.
 #![no_std]
 
-use soroban_sdk::{contract, contracterror, contractevent, contractimpl, contracttype, Address, Env};
+use soroban_sdk::{contract, contracterror, contractevent, contractimpl, contracttype, Address, Env, Vec};
 
 // ---- Economy numbers (must match economy.json) ----------------------
 const ROUNDS: u32 = 20;
@@ -41,6 +45,7 @@ const STALL_COST: i32 = 8;
 const STALL_PAY: i32 = 1;
 const BUSINESS_COST: i32 = 24;
 const BUSINESS_PAY: i32 = 4;
+const MAX_ACTIONS_PER_ROUND: u32 = 2;
 
 // ---- Persona modifiers -----------------------------------------------
 // Chosen once at join() and fixed for the life of the game. Each persona
@@ -130,6 +135,38 @@ impl Player {
     }
 }
 
+/// The economy's fixed numbers, so a client doesn't have to hardcode a
+/// copy that silently drifts when the contract is redeployed. Values are
+/// the same constants the contract itself uses.
+#[contracttype]
+#[derive(Clone)]
+pub struct Config {
+    pub rounds: u32,
+    pub starting_cash: i32,
+    pub salary: i32,
+    pub base_expense: i32,
+    pub expense_step: i32,
+    pub expense_step_rounds: u32,
+    pub emergency_cost: i32,
+    pub side_hustle_gain: i32,
+    pub loan_amount: i32,
+    pub loan_repay_cost: i32,
+    pub loan_expense: i32,
+    pub max_loans: u32,
+    pub insurance_expense: i32,
+    pub stall_cost: i32,
+    pub stall_pay: i32,
+    pub business_cost: i32,
+    pub business_pay: i32,
+    pub hustler_side_hustle_gain: i32,
+    pub gambler_side_hustle_loss: i32,
+    pub gambler_side_hustle_win: i32,
+    pub saver_expense_discount: i32,
+    pub builder_stall_discount: i32,
+    pub builder_business_discount: i32,
+    pub max_actions_per_round: u32,
+}
+
 #[contracttype]
 #[derive(Clone)]
 pub enum DataKey {
@@ -151,10 +188,19 @@ pub enum Error {
     MaxLoansReached = 9,
     NoLoanToRepay = 10,
     AlreadyInsured = 11,
+    TooManyActions = 12, // play_round got more actions than a round can hold
 }
 
 // Emitted after every state change so a crypto-curious player can read
 // their whole game back from the event log instead of trusting a UI.
+#[contractevent]
+pub struct PlayerJoined {
+    #[topic]
+    pub player: Address,
+    pub persona: Persona,
+    pub starting_cash: i32,
+}
+
 #[contractevent]
 pub struct RoundResolved {
     #[topic]
@@ -173,6 +219,46 @@ pub struct ActionTaken {
     pub round: u32,
     pub action: Action,
     pub cash_after: i32,
+}
+
+/// A planned action inside `play_round` that the round's own result made
+/// impossible (usually `CantAfford` after an Emergency or a Market Dip).
+/// Emitted instead of failing the whole transaction -- failing would throw
+/// away a roll the player already paid for. The action is *not* silently
+/// dropped: it is logged, it does not consume an action slot, and the
+/// round stays open so the player can choose a different action.
+#[contractevent]
+pub struct ActionSkipped {
+    #[topic]
+    pub player: Address,
+    pub round: u32,
+    pub action: Action,
+    pub error_code: u32,
+}
+
+#[contractevent]
+pub struct LoanTaken {
+    #[topic]
+    pub player: Address,
+    pub round: u32,
+    pub loans: u32,
+    pub cash_after: i32,
+}
+
+#[contractevent]
+pub struct LoanRepaid {
+    #[topic]
+    pub player: Address,
+    pub round: u32,
+    pub loans: u32,
+    pub cash_after: i32,
+}
+
+#[contractevent]
+pub struct InsuranceBought {
+    #[topic]
+    pub player: Address,
+    pub round: u32,
 }
 
 #[contractevent]
@@ -224,6 +310,7 @@ impl StormEconomy {
         };
         env.storage().persistent().set(&key, &state);
         extend_ttl(&env, &key);
+        PlayerJoined { player: player.clone(), persona, starting_cash: STARTING_CASH }.publish(&env);
         Ok(())
     }
 
@@ -234,74 +321,59 @@ impl StormEconomy {
         player.require_auth();
         let key = DataKey::Player(player.clone());
         let mut p: Player = env.storage().persistent().get(&key).ok_or(Error::NotJoined)?;
-        if p.game_over {
-            return Err(Error::GameOver);
-        }
-        if p.bankrupt {
-            return Err(Error::Bankrupt);
-        }
-        if !p.awaiting_roll {
-            return Err(Error::AlreadyRolled);
+        require_ready_to_roll(&p)?;
+
+        let (roll, hit_free) = resolve_roll(&env, &mut p);
+        publish_round(&env, &player, &p, roll, hit_free);
+
+        env.storage().persistent().set(&key, &p);
+        extend_ttl(&env, &key);
+        Ok(roll)
+    }
+
+    /// The whole round in one signed transaction: roll + payday, then the
+    /// supplied actions in order, up to `MAX_ACTIONS_PER_ROUND`.
+    ///
+    /// This is additive, not a replacement: `roll_and_pay` and
+    /// `take_action` still work exactly as before, so a client can keep
+    /// the sign-every-step path. A round whose action turns out to be
+    /// unaffordable does *not* fail the whole transaction (that would
+    /// throw away a roll already paid for) -- it publishes `ActionSkipped`,
+    /// leaves that action slot unspent, and stops attempting the rest of
+    /// the list, matching what the browser client's step-by-step planner
+    /// already does on a contract rejection.
+    pub fn play_round(env: Env, player: Address, actions: Vec<Action>) -> Result<EventRoll, Error> {
+        player.require_auth();
+        let key = DataKey::Player(player.clone());
+        let mut p: Player = env.storage().persistent().get(&key).ok_or(Error::NotJoined)?;
+        require_ready_to_roll(&p)?;
+        if actions.len() > MAX_ACTIONS_PER_ROUND {
+            return Err(Error::TooManyActions);
         }
 
-        let roll = roll_event(&env);
-        if roll == EventRoll::Storm && !p.insured {
-            // lose the priciest uninsured asset
-            if p.businesses > 0 {
-                p.businesses -= 1;
-            } else if p.stalls > 0 {
-                p.stalls -= 1;
+        let (roll, hit_free) = resolve_roll(&env, &mut p);
+        publish_round(&env, &player, &p, roll, hit_free);
+
+        // Bankrupt after payday: the round is over and no action can help.
+        if p.bankrupt {
+            env.storage().persistent().set(&key, &p);
+            extend_ttl(&env, &key);
+            return Ok(roll);
+        }
+
+        for action in actions.iter() {
+            match apply_action(&env, &mut p, action) {
+                Ok(()) => {
+                    ActionTaken { player: player.clone(), round: p.round, action, cash_after: p.cash }.publish(&env);
+                }
+                Err(e) => {
+                    ActionSkipped { player: player.clone(), round: p.round, action, error_code: e as u32 }.publish(&env);
+                    break;
+                }
             }
         }
-        if roll == EventRoll::Emergency {
-            p.cash -= EMERGENCY_COST;
-        }
 
-        let exp = p.expenses(p.round);
-        let nominal_passive = p.passive_income();
-        let used_passive = if roll == EventRoll::MarketDip { nominal_passive / 2 } else { nominal_passive };
-        p.cash += SALARY + used_passive - exp;
-
-        let mut hit_free = false;
-        if p.free_round == 0 && nominal_passive >= exp {
-            p.free_round = p.round;
-            hit_free = true;
-        }
-
-        // bankruptcy check: sell at half price, businesses first (pricier)
-        while p.cash < 0 && (p.businesses > 0 || p.stalls > 0) {
-            if p.businesses > 0 {
-                p.businesses -= 1;
-                p.cash += BUSINESS_COST / 2;
-            } else {
-                p.stalls -= 1;
-                p.cash += STALL_COST / 2;
-            }
-        }
-        if p.cash < 0 {
-            p.bankrupt = true;
-            p.bankrupt_round = p.round;
-            p.game_over = true;
-            p.final_score = -999;
-        }
-
-        p.awaiting_roll = false;
-        p.actions_left = 2;
-
-        RoundResolved {
-            player: player.clone(),
-            round: p.round,
-            roll,
-            cash_after_payday: p.cash,
-            bankrupt: p.bankrupt,
-            hit_free_milestone: hit_free,
-        }
-        .publish(&env);
-
-        if p.bankrupt {
-            GameFinished { player: player.clone(), final_score: p.final_score, final_cash: p.cash, bankrupt: true }
-                .publish(&env);
-        }
+        maybe_finish_round(&env, &player, &mut p);
 
         env.storage().persistent().set(&key, &p);
         extend_ttl(&env, &key);
@@ -323,58 +395,9 @@ impl StormEconomy {
             return Err(Error::NoActionsLeft);
         }
 
-        match action {
-            Action::BuyStall => {
-                let cost = stall_cost(p.persona);
-                if p.cash < cost {
-                    return Err(Error::CantAfford);
-                }
-                p.cash -= cost;
-                p.stalls += 1;
-            }
-            Action::BuyBusiness => {
-                let cost = business_cost(p.persona);
-                if p.cash < cost {
-                    return Err(Error::CantAfford);
-                }
-                p.cash -= cost;
-                p.businesses += 1;
-            }
-            Action::SideHustle => {
-                let gain = match p.persona {
-                    Persona::Hustler => HUSTLER_SIDE_HUSTLE_GAIN,
-                    Persona::Gambler => {
-                        if env.prng().gen_range::<u64>(0u64..=1u64) == 1u64 {
-                            GAMBLER_SIDE_HUSTLE_WIN
-                        } else {
-                            GAMBLER_SIDE_HUSTLE_LOSS
-                        }
-                    }
-                    _ => SIDE_HUSTLE_GAIN,
-                };
-                p.cash += gain;
-            }
-        }
-        p.actions_left -= 1;
-
+        apply_action(&env, &mut p, action)?;
         ActionTaken { player: player.clone(), round: p.round, action, cash_after: p.cash }.publish(&env);
-
-        if p.actions_left == 0 {
-            if p.round >= ROUNDS {
-                p.final_score = p.passive_income() - p.expenses(ROUNDS);
-                p.game_over = true;
-                GameFinished {
-                    player: player.clone(),
-                    final_score: p.final_score,
-                    final_cash: p.cash,
-                    bankrupt: false,
-                }
-                .publish(&env);
-            } else {
-                p.round += 1;
-                p.awaiting_roll = true;
-            }
-        }
+        maybe_finish_round(&env, &player, &mut p);
 
         env.storage().persistent().set(&key, &p);
         extend_ttl(&env, &key);
@@ -393,6 +416,7 @@ impl StormEconomy {
         }
         p.loans += 1;
         p.cash += LOAN_AMOUNT;
+        LoanTaken { player: player.clone(), round: p.round, loans: p.loans, cash_after: p.cash }.publish(&env);
         env.storage().persistent().set(&key, &p);
         extend_ttl(&env, &key);
         Ok(())
@@ -411,6 +435,7 @@ impl StormEconomy {
         }
         p.loans -= 1;
         p.cash -= LOAN_REPAY_COST;
+        LoanRepaid { player: player.clone(), round: p.round, loans: p.loans, cash_after: p.cash }.publish(&env);
         env.storage().persistent().set(&key, &p);
         extend_ttl(&env, &key);
         Ok(())
@@ -425,6 +450,7 @@ impl StormEconomy {
             return Err(Error::AlreadyInsured);
         }
         p.insured = true;
+        InsuranceBought { player: player.clone(), round: p.round }.publish(&env);
         env.storage().persistent().set(&key, &p);
         extend_ttl(&env, &key);
         Ok(())
@@ -432,6 +458,179 @@ impl StormEconomy {
 
     pub fn get_state(env: Env, player: Address) -> Result<Player, Error> {
         env.storage().persistent().get(&DataKey::Player(player)).ok_or(Error::NotJoined)
+    }
+
+    /// The contract's own numbers, so clients and the indexer can stop
+    /// hardcoding a copy that drifts on redeploy.
+    pub fn get_config(_env: Env) -> Config {
+        Config {
+            rounds: ROUNDS,
+            starting_cash: STARTING_CASH,
+            salary: SALARY,
+            base_expense: BASE_EXPENSE,
+            expense_step: EXPENSE_STEP,
+            expense_step_rounds: EXPENSE_STEP_ROUNDS,
+            emergency_cost: EMERGENCY_COST,
+            side_hustle_gain: SIDE_HUSTLE_GAIN,
+            loan_amount: LOAN_AMOUNT,
+            loan_repay_cost: LOAN_REPAY_COST,
+            loan_expense: LOAN_EXPENSE,
+            max_loans: MAX_LOANS,
+            insurance_expense: INSURANCE_EXPENSE,
+            stall_cost: STALL_COST,
+            stall_pay: STALL_PAY,
+            business_cost: BUSINESS_COST,
+            business_pay: BUSINESS_PAY,
+            hustler_side_hustle_gain: HUSTLER_SIDE_HUSTLE_GAIN,
+            gambler_side_hustle_loss: GAMBLER_SIDE_HUSTLE_LOSS,
+            gambler_side_hustle_win: GAMBLER_SIDE_HUSTLE_WIN,
+            saver_expense_discount: SAVER_EXPENSE_DISCOUNT,
+            builder_stall_discount: BUILDER_STALL_DISCOUNT,
+            builder_business_discount: BUILDER_BUSINESS_DISCOUNT,
+            max_actions_per_round: MAX_ACTIONS_PER_ROUND,
+        }
+    }
+}
+
+fn require_ready_to_roll(p: &Player) -> Result<(), Error> {
+    if p.game_over {
+        return Err(Error::GameOver);
+    }
+    if p.bankrupt {
+        return Err(Error::Bankrupt);
+    }
+    if !p.awaiting_roll {
+        return Err(Error::AlreadyRolled);
+    }
+    Ok(())
+}
+
+/// Event roll + payday + free milestone + bankruptcy liquidation, and the
+/// per-round bookkeeping both `roll_and_pay` and `play_round` need.
+/// Returns the roll and whether this round hit the "Free" milestone;
+/// publishes nothing itself, so callers control event order.
+fn resolve_roll(env: &Env, p: &mut Player) -> (EventRoll, bool) {
+    let roll = roll_event(env);
+    if roll == EventRoll::Storm && !p.insured {
+        // lose the priciest uninsured asset
+        if p.businesses > 0 {
+            p.businesses -= 1;
+        } else if p.stalls > 0 {
+            p.stalls -= 1;
+        }
+    }
+    if roll == EventRoll::Emergency {
+        p.cash -= EMERGENCY_COST;
+    }
+
+    let exp = p.expenses(p.round);
+    let nominal_passive = p.passive_income();
+    let used_passive = if roll == EventRoll::MarketDip { nominal_passive / 2 } else { nominal_passive };
+    p.cash += SALARY + used_passive - exp;
+
+    let mut hit_free = false;
+    if p.free_round == 0 && nominal_passive >= exp {
+        p.free_round = p.round;
+        hit_free = true;
+    }
+
+    // bankruptcy check: sell at half price, businesses first (pricier)
+    while p.cash < 0 && (p.businesses > 0 || p.stalls > 0) {
+        if p.businesses > 0 {
+            p.businesses -= 1;
+            p.cash += BUSINESS_COST / 2;
+        } else {
+            p.stalls -= 1;
+            p.cash += STALL_COST / 2;
+        }
+    }
+    if p.cash < 0 {
+        p.bankrupt = true;
+        p.bankrupt_round = p.round;
+        p.game_over = true;
+        p.final_score = -999;
+    }
+
+    p.awaiting_roll = false;
+    p.actions_left = MAX_ACTIONS_PER_ROUND;
+
+    (roll, hit_free)
+}
+
+fn publish_round(env: &Env, player: &Address, p: &Player, roll: EventRoll, hit_free: bool) {
+    RoundResolved {
+        player: player.clone(),
+        round: p.round,
+        roll,
+        cash_after_payday: p.cash,
+        bankrupt: p.bankrupt,
+        hit_free_milestone: hit_free,
+    }
+    .publish(env);
+
+    if p.bankrupt {
+        GameFinished { player: player.clone(), final_score: p.final_score, final_cash: p.cash, bankrupt: true }.publish(env);
+    }
+}
+
+/// Apply one buy/hustle action and spend its slot. Shared by
+/// `take_action` and `play_round` so the arithmetic can't drift between
+/// the two entry points.
+fn apply_action(env: &Env, p: &mut Player, action: Action) -> Result<(), Error> {
+    match action {
+        Action::BuyStall => {
+            let cost = stall_cost(p.persona);
+            if p.cash < cost {
+                return Err(Error::CantAfford);
+            }
+            p.cash -= cost;
+            p.stalls += 1;
+        }
+        Action::BuyBusiness => {
+            let cost = business_cost(p.persona);
+            if p.cash < cost {
+                return Err(Error::CantAfford);
+            }
+            p.cash -= cost;
+            p.businesses += 1;
+        }
+        Action::SideHustle => {
+            let gain = match p.persona {
+                Persona::Hustler => HUSTLER_SIDE_HUSTLE_GAIN,
+                Persona::Gambler => {
+                    if env.prng().gen_range::<u64>(0u64..=1u64) == 1u64 {
+                        GAMBLER_SIDE_HUSTLE_WIN
+                    } else {
+                        GAMBLER_SIDE_HUSTLE_LOSS
+                    }
+                }
+                _ => SIDE_HUSTLE_GAIN,
+            };
+            p.cash += gain;
+        }
+    }
+    p.actions_left -= 1;
+    Ok(())
+}
+
+/// Once both action slots are spent, advance to the next round or, on
+/// round `ROUNDS`, finalize the score and publish `GameFinished`.
+fn maybe_finish_round(env: &Env, player: &Address, p: &mut Player) {
+    if p.actions_left == 0 {
+        if p.round >= ROUNDS {
+            p.final_score = p.passive_income() - p.expenses(ROUNDS);
+            p.game_over = true;
+            GameFinished {
+                player: player.clone(),
+                final_score: p.final_score,
+                final_cash: p.cash,
+                bankrupt: false,
+            }
+            .publish(env);
+        } else {
+            p.round += 1;
+            p.awaiting_roll = true;
+        }
     }
 }
 

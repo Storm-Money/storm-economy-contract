@@ -1,7 +1,7 @@
 #![cfg(test)]
 
 use super::*;
-use soroban_sdk::testutils::Address as _;
+use soroban_sdk::testutils::{Address as _, Events};
 use soroban_sdk::Env;
 
 fn setup(env: &Env) -> (StormEconomyClient<'_>, Address) {
@@ -221,4 +221,145 @@ fn fourth_loan_is_rejected() {
     client.take_loan(&player);
     let err = client.try_take_loan(&player);
     assert_eq!(err, Err(Ok(Error::MaxLoansReached)));
+}
+
+// ---- v3: one-transaction rounds, config view, new events ---------------
+
+#[test]
+fn play_round_with_two_actions_advances_like_the_two_step_path() {
+    let env = Env::default();
+    let (client, player) = setup(&env);
+
+    client.play_round(&player, &soroban_sdk::vec![&env, Action::SideHustle, Action::SideHustle]);
+
+    let after = client.get_state(&player);
+    assert_eq!(after.round, 2);
+    assert!(after.awaiting_roll);
+    assert_eq!(after.actions_left, 0);
+}
+
+#[test]
+fn play_round_with_one_action_leaves_the_round_open() {
+    let env = Env::default();
+    let (client, player) = setup(&env);
+
+    client.play_round(&player, &soroban_sdk::vec![&env, Action::SideHustle]);
+
+    let after = client.get_state(&player);
+    assert!(!after.awaiting_roll);
+    assert_eq!(after.actions_left, 1);
+    assert_eq!(after.round, 1);
+}
+
+/// A business costs 24; round 1 pays at most 13 even before any action, so
+/// this action can never be afforded here. The transaction must still
+/// succeed (the roll is real and already paid for), log the skip, leave
+/// the slot unspent, and stop rather than attempting the next action.
+#[test]
+fn play_round_logs_an_unaffordable_action_instead_of_reverting_the_round() {
+    let env = Env::default();
+    let (client, player) = setup(&env);
+
+    client.play_round(&player, &soroban_sdk::vec![&env, Action::BuyBusiness, Action::SideHustle]);
+    // Read events before any further invocation: `all()` reports only the
+    // most recent invocation's events.
+    let emitted = env.events().all().events().len();
+
+    let after = client.get_state(&player);
+    assert_eq!(after.businesses, 0);
+    assert_eq!(after.actions_left, MAX_ACTIONS_PER_ROUND);
+    assert_eq!(after.round, 1);
+    assert!(!after.awaiting_roll);
+    assert!(!after.bankrupt);
+    // RoundResolved + ActionSkipped; the SideHustle after the skip was not
+    // attempted, so it produced no ActionTaken.
+    assert_eq!(emitted, 2);
+}
+
+#[test]
+fn play_round_rejects_more_actions_than_a_round_allows() {
+    let env = Env::default();
+    let (client, player) = setup(&env);
+
+    let err = client.try_play_round(
+        &player,
+        &soroban_sdk::vec![&env, Action::SideHustle, Action::SideHustle, Action::SideHustle],
+    );
+    assert_eq!(err, Err(Ok(Error::TooManyActions)));
+}
+
+#[test]
+fn play_round_after_this_rounds_roll_fails() {
+    let env = Env::default();
+    let (client, player) = setup(&env);
+    client.roll_and_pay(&player);
+
+    let err = client.try_play_round(&player, &soroban_sdk::vec![&env]);
+    assert_eq!(err, Err(Ok(Error::AlreadyRolled)));
+}
+
+/// Same regression gate as `side_hustle_only_scores_exactly_minus_eleven`,
+/// driven through the one-transaction path: folding a round into one tx
+/// must not change the economy's arithmetic.
+#[test]
+fn play_round_only_scores_exactly_minus_eleven() {
+    let env = Env::default();
+    let (client, player) = setup(&env);
+
+    loop {
+        client.play_round(&player, &soroban_sdk::vec![&env, Action::SideHustle, Action::SideHustle]);
+        let state = client.get_state(&player);
+        assert!(!state.bankrupt, "side-hustle-only should never go bankrupt");
+        if state.game_over {
+            assert_eq!(state.final_score, -11, "one-tx rounds drifted from the two-step economy");
+            break;
+        }
+    }
+}
+
+#[test]
+fn get_config_matches_the_contracts_own_constants() {
+    let env = Env::default();
+    let (client, _player) = setup(&env);
+
+    let c = client.get_config();
+    assert_eq!(c.rounds, ROUNDS);
+    assert_eq!(c.starting_cash, STARTING_CASH);
+    assert_eq!(c.salary, SALARY);
+    assert_eq!(c.base_expense, BASE_EXPENSE);
+    assert_eq!(c.expense_step_rounds, EXPENSE_STEP_ROUNDS);
+    assert_eq!(c.emergency_cost, EMERGENCY_COST);
+    assert_eq!(c.max_loans, MAX_LOANS);
+    assert_eq!(c.stall_cost, STALL_COST);
+    assert_eq!(c.stall_pay, STALL_PAY);
+    assert_eq!(c.business_cost, BUSINESS_COST);
+    assert_eq!(c.business_pay, BUSINESS_PAY);
+    assert_eq!(c.hustler_side_hustle_gain, HUSTLER_SIDE_HUSTLE_GAIN);
+    assert_eq!(c.gambler_side_hustle_win, GAMBLER_SIDE_HUSTLE_WIN);
+    assert_eq!(c.saver_expense_discount, SAVER_EXPENSE_DISCOUNT);
+    assert_eq!(c.builder_stall_discount, BUILDER_STALL_DISCOUNT);
+    assert_eq!(c.builder_business_discount, BUILDER_BUSINESS_DISCOUNT);
+    assert_eq!(c.max_actions_per_round, MAX_ACTIONS_PER_ROUND);
+}
+
+/// v2 emitted nothing on join and nothing for the free actions, which is
+/// why the indexer could not show them. That gap is what this closes.
+#[test]
+fn join_and_free_actions_each_publish_an_event() {
+    let env = Env::default();
+    let (client, player) = setup(&env);
+    // `all()` reports only the most recent invocation's events.
+    assert_eq!(env.events().all().events().len(), 1, "join should publish PlayerJoined");
+
+    client.roll_and_pay(&player);
+    assert_eq!(env.events().all().events().len(), 1, "roll still publishes exactly RoundResolved");
+
+    client.take_loan(&player);
+    assert_eq!(env.events().all().events().len(), 1, "take_loan should publish LoanTaken");
+
+    client.repay_loan(&player);
+    assert_eq!(env.events().all().events().len(), 1, "repay_loan should publish LoanRepaid");
+
+    client.buy_insurance(&player);
+    assert_eq!(env.events().all().events().len(), 1, "buy_insurance should publish InsuranceBought");
 }
